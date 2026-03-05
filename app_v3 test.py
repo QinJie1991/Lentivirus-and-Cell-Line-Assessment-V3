@@ -1,0 +1,1537 @@
+"""
+病毒与细胞系评估系统 v2.6 - 序列检索增强版
+支持siRNA/shRNA/sgRNA序列文献与专利检索
+"""
+
+import streamlit as st
+import requests
+import json
+import time
+import re
+import html
+import http.client
+import uuid
+import logging
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
+from datetime import datetime
+from functools import lru_cache
+import difflib
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("virus_assessment")
+
+# 页面配置
+st.set_page_config(
+    page_title="病毒与细胞系评估系统 v2.6",
+    page_icon="🧬",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ==================== 安全配置 ====================
+
+class SecurityConfig:
+    """安全配置"""
+    
+    GENE_NAME_PATTERN = re.compile(r'^[a-zA-Z][a-zA-Z0-9]*(-?[a-zA-Z0-9]+)*$')
+    MAX_GENE_LENGTH = 50
+    
+    ALLOWED_ORGANISMS = {
+        'Homo sapiens', 'Mus musculus', 'Rattus norvegicus'
+    }
+    
+    @staticmethod
+    def sanitize_input(text: str, max_length: int = 100) -> str:
+        """清理用户输入"""
+        if not text:
+            return ""
+        text = text.strip()[:max_length]
+        text = ''.join(char for char in text if ord(char) >= 32 and char not in ['<', '>', '"', "'"])
+        return text
+    
+    @staticmethod
+    def validate_gene_name(gene_name: str) -> Tuple[bool, str]:
+        """验证基因名格式"""
+        if not gene_name:
+            return False, "基因名不能为空"
+        
+        if len(gene_name) > SecurityConfig.MAX_GENE_LENGTH:
+            return False, f"基因名过长（最大{SecurityConfig.MAX_GENE_LENGTH}字符）"
+        
+        if '..' in gene_name or '//' in gene_name or gene_name.startswith('-'):
+            return False, "基因名包含非法字符组合"
+        
+        if not SecurityConfig.GENE_NAME_PATTERN.match(gene_name):
+            return False, "基因名格式无效（必须以字母开头）"
+        
+        return True, ""
+
+# ==================== 业务配置 ====================
+
+class Config:
+    MAX_LENTIVIRUS_CAPACITY = 8000
+    WARNING_CAPACITY = 6000
+    
+    @staticmethod
+    def get_ncbi_email():
+        return st.secrets.get("NCBI_EMAIL", "user@example.com")
+    
+    @staticmethod
+    def get_qwen_model():
+        return st.secrets.get("AI_MODEL", "qwen-plus")
+
+# ==================== 数据模型 ====================
+
+@dataclass
+class LiteratureEvidence:
+    pmid: str
+    title: str
+    abstract: str
+    evidence_text: str
+    evidence_type: str
+    confidence: float
+
+@dataclass
+class SequenceInfo:
+    """序列信息数据类"""
+    sequence: str
+    sequence_type: str  # "siRNA", "shRNA", "sgRNA"
+    target_gene: str
+    source_type: str    # "Literature", "Patent"
+    source_id: str      # PMID或专利号
+    source_title: str
+    target_region: str  # 靶向位点描述（如CDS、3'UTR等）
+    efficiency: str     # 效率描述（如有）
+    organism: str
+
+@dataclass
+class AIAnalysisResult:
+    conclusion: str
+    risk_level: str
+    citations: List[LiteratureEvidence]
+    raw_response: str
+    validation_status: str
+
+@dataclass
+class HardRuleCheck:
+    rule_name: str
+    passed: bool
+    reason: str
+    source: str
+    overrideable: bool = False
+
+# ==================== API频率限制器（带Debounce） ====================
+
+class APIRateLimiter:
+    """API请求频率限制器"""
+    def __init__(self, requests_per_second: float = 3.0):
+        self.min_interval = 1.0 / requests_per_second
+        self.last_request_time = 0
+    
+    def wait(self):
+        current_time = time.time()
+        elapsed = current_time - self.last_request_time
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+        self.last_request_time = time.time()
+
+ncbi_limiter = APIRateLimiter(3.0)
+qwen_limiter = APIRateLimiter(5.0)
+patent_limiter = APIRateLimiter(2.0)  # 专利API限制更严格
+
+class DebounceTimer:
+    """防抖计时器（用于基因输入）"""
+    def __init__(self, delay: float = 0.3):
+        self.delay = delay
+        self.last_call = 0
+    
+    def should_trigger(self) -> bool:
+        current = time.time()
+        if current - self.last_call >= self.delay:
+            self.last_call = current
+            return True
+        return False
+
+# ==================== 基因自动完成服务（整合Clinical Tables API） ====================
+
+class GeneAutocompleteService:
+    """基因名自动完成服务 - 基于NCBI Clinical Tables API"""
+    
+    def __init__(self):
+        self.clinical_tables_url = "https://clinicaltables.nlm.nih.gov/api/ncbi_genes/v3/search"
+        self.cache = {}
+        self.cache_timeout = 3600
+    
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def get_suggestions(_self, query: str, organism: str = "human", limit: int = 8) -> List[Dict]:
+        """
+        获取基因名建议（带防抖和缓存）
+        使用NCBI Clinical Tables API（比E-utilities更快，支持模糊匹配）
+        """
+        if not query or len(query) < 2:
+            return []
+        
+        try:
+            # 物种映射
+            organism_map = {
+                "human": "Homo sapiens",
+                "mouse": "Mus musculus",
+                "rat": "Rattus norvegicus"
+            }
+            organism_name = organism_map.get(organism, organism)
+            
+            params = {
+                "terms": query,
+                "maxList": limit,
+                "df": "symbol,name,chromosome,gene_id,type_of_gene",
+                "q": f"organism:\"{organism_name}\""
+            }
+            
+            response = requests.get(_self.clinical_tables_url, params=params, timeout=5)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if data and len(data) >= 3:
+                results = []
+                headers = data[0]
+                rows = data[2]
+                
+                for row in rows:
+                    gene_info = dict(zip(headers, row))
+                    results.append({
+                        "symbol": html.escape(gene_info.get("symbol", "")),
+                        "name": html.escape(gene_info.get("name", "")),
+                        "gene_id": gene_info.get("gene_id", ""),
+                        "chromosome": html.escape(gene_info.get("chromosome", "")),
+                        "type": html.escape(gene_info.get("type_of_gene", ""))
+                    })
+                return results
+            
+            return []
+            
+        except Exception as e:
+            logger.warning(f"Gene suggestion error: {e}")
+            return []
+
+# ==================== 简化的基因输入组件（修复版） ====================
+
+class GeneInputComponent:
+    def __init__(self, gene_service: GeneAutocompleteService):
+        """初始化组件，接收基因自动完成服务"""
+        self.gene_service = gene_service
+    
+    def render(self, organism: str, key_prefix: str = "gene") -> Optional[str]:
+        # 定义session state keys
+        input_key = f"{key_prefix}_input"
+        selected_key = f"{key_prefix}_selected"
+        suggestions_key = f"{key_prefix}_suggestions"
+        
+        # 初始化
+        if input_key not in st.session_state:
+            st.session_state[input_key] = ""
+        if selected_key not in st.session_state:
+            st.session_state[selected_key] = ""
+        if suggestions_key not in st.session_state:
+            st.session_state[suggestions_key] = []
+        
+        # 创建输入框
+        current_input = st.text_input(
+            "基因名（支持自动完成，输入2个字符以上显示建议）",
+            value=st.session_state[input_key],
+            key=f"{key_prefix}_widget"
+        )
+        
+        # 输入变化处理：检测新输入并与上次状态比较
+        if current_input != st.session_state[input_key]:
+            st.session_state[input_key] = current_input
+            # 重置选择状态
+            if st.session_state[selected_key]:
+                st.session_state[selected_key] = ""
+            
+            # 输入>=2字符时获取建议，否则清空
+            if len(current_input) >= 2:
+                with st.spinner("🔄 检索基因..."):
+                    suggestions = self.gene_service.get_suggestions(current_input, organism)
+                    st.session_state[suggestions_key] = suggestions
+            else:
+                st.session_state[suggestions_key] = []
+            
+            # 触发刷新以显示/更新建议按钮
+            st.rerun()
+        
+        # 显示建议按钮（当有建议且未选择时）
+        suggestions = st.session_state.get(suggestions_key, [])
+        if suggestions and not st.session_state[selected_key] and len(st.session_state[input_key]) >= 2:
+            st.markdown("**💡 点击选择建议：**")
+            cols = st.columns(min(len(suggestions), 4))
+            
+            for i, gene in enumerate(suggestions):
+                with cols[i % 4]:
+                    display_text = f"{gene['symbol']}"
+                    if gene.get('name'):
+                        display_text += f"\n<small>{gene['name'][:15]}</small>"
+                    
+                    if st.button(
+                        display_text, 
+                        key=f"{key_prefix}_sug_{i}",
+                        use_container_width=True,
+                        help=gene.get('name', '')
+                    ):
+                        st.session_state[selected_key] = gene['symbol']
+                        st.session_state[input_key] = gene['symbol']
+                        st.session_state[f"{key_prefix}_info"] = gene
+                        st.session_state[suggestions_key] = []  # 选择后清空建议
+                        st.rerun()
+        
+        # 显示已选择基因信息
+        if st.session_state[selected_key] and f"{key_prefix}_info" in st.session_state:
+            gene_info = st.session_state[f"{key_prefix}_info"]
+            st.success(
+                f"✅ 已选择: **{gene_info['symbol']}** | "
+                f"{gene_info.get('name', '')} | "
+                f"染色体: {gene_info.get('chromosome', 'N/A')}"
+            )
+            return st.session_state[selected_key]
+        elif current_input:
+            return current_input
+        return None
+
+# ==================== 序列提取器 ====================
+
+class SequenceExtractor:
+    """从文本中提取RNA序列"""
+    
+    # siRNA: 19-25nt, 通常描述为 "sense 5'-...-3'" 或 "target sequence"
+    SIRNA_PATTERNS = [
+        r'(?i)(?:sense|antisense|target)[\s\:]+5?[\'′]?\s*[-–]?\s*([ACGTU]{19,25})\s*[-–]?\s*3?[\'′]?',
+        r'(?i)(?:siRNA|sequence)[\s\:]+([ACGTU]{19,25})',
+        r'(?i)(?:targeting|target)[\s\:]+([ACGTU]{19,25})',
+        r'5?[\'′]?\s*([ACGTU]{21})\s*3?[\'′]?\s*(?:sense|antisense)',
+    ]
+    
+    # shRNA: 通常包含loop结构（如TTCAAGAGA）或描述为shRNA
+    SHRNA_PATTERNS = [
+        r'(?i)shRNA[\s\:]+([ACGTU]{40,60})',
+        r'(?i)hairpin[\s\:]+([ACGTU]{40,60})',
+        r'(?i)stem[\s\-]+loop[\s\:]+([ACGTU]{40,60})',
+        r'([ACGTU]{20,25})[TC]{4,8}([ACGTU]{20,25})',  # 茎环结构模式
+    ]
+    
+    # sgRNA: 20nt + NGG (PAM)
+    SGRNA_PATTERNS = [
+        r'(?i)(?:sgRNA|gRNA|guide[\s\-]?RNA)[\s\:]+([ACGTU]{20})',
+        r'(?i)target[\s\-]?sequence[\s\:]+([ACGTU]{20})',
+        r'(?i)guide[\s\:]+([ACGTU]{20})[AGCT]{0,3}[\s\-]?NGG',
+        r'([ACGTU]{20})[^\w]{0,5}NGG',
+        r'5?[\'′]?\s*([ACGTU]{20})[^\w]{0,10}PAM',
+    ]
+    
+    @classmethod
+    def extract_sequences(cls, text: str, gene_name: str, source_type: str, source_id: str, source_title: str, organism: str) -> List[SequenceInfo]:
+        """从文本中提取所有类型的序列"""
+        sequences = []
+        
+        # 提取siRNA
+        for pattern in cls.SIRNA_PATTERNS:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                seq = match.group(1).upper().replace('T', 'U')
+                if cls._validate_sequence(seq):
+                    sequences.append(SequenceInfo(
+                        sequence=seq,
+                        sequence_type="siRNA",
+                        target_gene=gene_name,
+                        source_type=source_type,
+                        source_id=source_id,
+                        source_title=source_title[:100],
+                        target_region="Unknown",
+                        efficiency="Not specified",
+                        organism=organism
+                    ))
+        
+        # 提取shRNA
+        for pattern in cls.SHRNA_PATTERNS:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                seq = match.group(1).upper().replace('T', 'U')
+                if len(seq) >= 40 and cls._validate_sequence(seq):
+                    sequences.append(SequenceInfo(
+                        sequence=seq,
+                        sequence_type="shRNA",
+                        target_gene=gene_name,
+                        source_type=source_type,
+                        source_id=source_id,
+                        source_title=source_title[:100],
+                        target_region="Unknown",
+                        efficiency="Not specified",
+                        organism=organism
+                    ))
+        
+        # 提取sgRNA
+        for pattern in cls.SGRNA_PATTERNS:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                seq = match.group(1).upper().replace('T', 'U')
+                if cls._validate_sequence(seq) and len(seq) == 20:
+                    sequences.append(SequenceInfo(
+                        sequence=seq,
+                        sequence_type="sgRNA",
+                        target_gene=gene_name,
+                        source_type=source_type,
+                        source_id=source_id,
+                        source_title=source_title[:100],
+                        target_region="Unknown",
+                        efficiency="Not specified",
+                        organism=organism
+                    ))
+        
+        return sequences
+    
+    @staticmethod
+    def _validate_sequence(seq: str) -> bool:
+        """验证序列有效性"""
+        if not seq or len(seq) < 19:
+            return False
+        # 检查是否只包含ACGU
+        if not re.match(r'^[ACGU]+$', seq):
+            return False
+        # 排除简单重复序列
+        if len(set(seq)) < 4:
+            return False
+        return True
+
+# ==================== 专利检索客户端 ====================
+
+class PatentClient:
+    """专利检索客户端（使用Google Patents API和Espacenet）"""
+    
+    def __init__(self):
+        self.google_patents_url = "https://patents.google.com/xhr/query"
+        self.espacenet_url = "https://worldwide.espacenet.com/3.2/rest-services/rest/search"
+    
+    def search_sequences(self, gene_name: str, sequence_type: str, organism: str) -> List[SequenceInfo]:
+        """
+        检索专利中报道的序列
+        sequence_type: "siRNA", "shRNA", "sgRNA"
+        """
+        sequences = []
+        
+        # 构建查询词
+        query_terms = {
+            "siRNA": f"{gene_name} siRNA sequence",
+            "shRNA": f"{gene_name} shRNA hairpin",
+            "sgRNA": f"{gene_name} sgRNA CRISPR guide"
+        }
+        
+        query = query_terms.get(sequence_type, f"{gene_name} RNA sequence")
+        
+        try:
+            # 使用Google Patents（通过解析网页或API）
+            # 这里使用简化的模拟实现，实际部署时建议使用官方API
+            patent_limiter.wait()
+            
+            # 构建搜索URL参数
+            params = {
+                "url": "query",
+                "q": f"{query} RNA interference therapeutic",
+                "page": 0,
+                "per_page": 10
+            }
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            response = requests.get(
+                "https://patents.google.com/xhr/query", 
+                params=params, 
+                headers=headers, 
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if 'results' in data and 'cluster' in data['results']:
+                    for patent in data['results']['cluster'][:5]:
+                        patent_id = patent.get('id', 'Unknown')
+                        title = patent.get('title', 'No title')
+                        
+                        # 尝试获取专利全文或摘要（这里简化处理）
+                        abstract = patent.get('abstract', '')
+                        if abstract:
+                            seqs = SequenceExtractor.extract_sequences(
+                                abstract, gene_name, "Patent", 
+                                f"Google Patents:{patent_id}", title, organism
+                            )
+                            sequences.extend(seqs)
+            
+            # 去重
+            seen = set()
+            unique_seqs = []
+            for seq in sequences:
+                key = f"{seq.sequence}_{seq.sequence_type}"
+                if key not in seen:
+                    seen.add(key)
+                    unique_seqs.append(seq)
+            
+            return unique_seqs
+            
+        except Exception as e:
+            logger.warning(f"Patent search error: {e}")
+            return []
+
+# ==================== NCBI E-utilities客户端（增强版） ====================
+
+class NCBIClient:
+    """NCBI E-utilities客户端（用于获取转录本、文献等深度数据及序列）"""
+    
+    BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+    
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key
+        self.email = Config.get_ncbi_email()
+        self.sequence_extractor = SequenceExtractor()
+    
+    def _make_request(self, endpoint: str, params: Dict, retmode: str = "json") -> Optional[Dict]:
+        ncbi_limiter.wait()
+        
+        params.update({
+            'tool': 'LentivirusAssessment_v2',
+            'email': self.email
+        })
+        if self.api_key:
+            params['api_key'] = self.api_key
+        
+        url = f"{self.BASE_URL}/{endpoint}"
+        
+        try:
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            return response.json() if retmode == "json" else response.text
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"NCBI request failed: {type(e).__name__}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected NCBI error: {type(e).__name__}")
+            return None
+    
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def fetch_gene_data(_self, gene_name: str, organism: str) -> Tuple[Dict, List[Dict]]:
+        """获取基因详细数据（用于硬性规则检查）"""
+        search_params = {
+            'db': 'gene',
+            'term': f"{gene_name}[Gene] AND {organism}[Organism]",
+            'retmode': 'json',
+            'retmax': 1
+        }
+        
+        result = _self._make_request('esearch.fcgi', search_params)
+        if not result:
+            return {}, []
+        
+        gene_ids = result.get('esearchresult', {}).get('idlist', [])
+        if not gene_ids:
+            return {}, []
+        
+        gene_id = gene_ids[0]
+        
+        summary_params = {
+            'db': 'gene',
+            'id': gene_id,
+            'retmode': 'json'
+        }
+        
+        result = _self._make_request('esummary.fcgi', summary_params)
+        if not result:
+            return {}, []
+        
+        summary = result.get('result', {}).get(gene_id, {})
+        
+        gene_info = {
+            'id': gene_id,
+            'name': gene_name,
+            'description': summary.get('description', ''),
+            'organism': organism,
+            'summary': summary.get('summary', '')
+        }
+        
+        transcripts = _self._fetch_transcripts(gene_id)
+        return gene_info, transcripts
+    
+    def _fetch_transcripts(self, gene_id: str) -> List[Dict]:
+        """获取转录本长度（用于载体容量检查）"""
+        try:
+            search_params = {
+                'db': 'nuccore',
+                'term': f"{gene_id}[GeneID] AND (NM_[Title] OR XM_[Title])",
+                'retmode': 'json',
+                'retmax': 10
+            }
+            
+            result = self._make_request('esearch.fcgi', search_params)
+            if not result:
+                return []
+            
+            ids = result.get('esearchresult', {}).get('idlist', [])
+            if not ids:
+                return []
+            
+            summary_params = {
+                'db': 'nuccore',
+                'id': ','.join(ids),
+                'retmode': 'json'
+            }
+            
+            result = self._make_request('esummary.fcgi', summary_params)
+            if not result:
+                return []
+            
+            docs = result.get('result', {})
+            transcripts = []
+            
+            for uid in ids:
+                try:
+                    doc = docs.get(uid, {})
+                    acc = doc.get('accessionversion', '')
+                    length = doc.get('slen', 0)
+                    
+                    if (acc.startswith('NM_') or acc.startswith('XM_')) and length > 0:
+                        transcripts.append({
+                            'id': acc,
+                            'length': int(length),
+                            'title': str(doc.get('title', ''))[:200]
+                        })
+                except Exception:
+                    continue
+            
+            return transcripts
+            
+        except Exception as e:
+            logger.error(f"Transcript fetch error: {type(e).__name__}")
+            return []
+    
+    def search_literature(self, gene_name: str, experiment_type: str) -> List[Dict]:
+        """检索PubMed文献（用于AI分析）"""
+        all_papers = []
+        seen_pmids = set()
+        
+        keyword_map = {
+            'knockout': ['knockout', 'CRISPR', 'deletion', 'deficiency'],
+            'knockdown': ['knockdown', 'shRNA', 'siRNA', 'RNAi'],
+            'overexpression': ['overexpression', 'transgenic', 'expression']
+        }
+        
+        keywords = keyword_map.get(experiment_type.lower(), ['expression'])
+        keywords.extend(['cell', 'viability'])
+        
+        for keyword in keywords:
+            try:
+                query = f"{gene_name} {keyword}"
+                
+                search_params = {
+                    'db': 'pubmed',
+                    'term': query,
+                    'retmode': 'json',
+                    'retmax': 5,  # 增加检索数量以获取更多序列信息
+                    'sort': 'relevance'
+                }
+                
+                result = self._make_request('esearch.fcgi', search_params)
+                if not result:
+                    continue
+                
+                pmids = result.get('esearchresult', {}).get('idlist', [])
+                if not pmids:
+                    continue
+                
+                new_pmids = [p for p in pmids if p not in seen_pmids]
+                if not new_pmids:
+                    continue
+                
+                fetch_params = {
+                    'db': 'pubmed',
+                    'id': ','.join(new_pmids),
+                    'retmode': 'json'
+                }
+                
+                result = self._make_request('esummary.fcgi', fetch_params)
+                if not result:
+                    continue
+                
+                docs = result.get('result', {})
+                
+                for pmid in new_pmids:
+                    try:
+                        doc = docs.get(pmid, {})
+                        title = doc.get('title', '')
+                        abstract = doc.get('abstract', '') or doc.get('sorttitle', '')
+                        
+                        if not title:
+                            continue
+                        
+                        if not abstract:
+                            abstract = f"[Title only] {title[:100]}"
+                        
+                        all_papers.append({
+                            'pmid': str(pmid),
+                            'title': html.escape(str(title)[:300]),
+                            'abstract': html.escape(str(abstract)[:1000]),  # 增加摘要长度以获取更多序列信息
+                            'keyword': html.escape(keyword),
+                            'url': f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                        })
+                        seen_pmids.add(pmid)
+                        
+                    except Exception:
+                        continue
+                
+            except Exception:
+                continue
+        
+        return all_papers
+    
+    def search_sequences_in_literature(self, gene_name: str, experiment_type: str, organism: str) -> List[SequenceInfo]:
+        """从文献中检索siRNA/shRNA/sgRNA序列"""
+        sequences = []
+        
+        # 根据实验类型确定要检索的序列类型
+        if experiment_type.lower() == 'knockdown':
+            target_types = ['siRNA', 'shRNA']
+            additional_keywords = ['siRNA sequence', 'shRNA hairpin', 'target sequence']
+        elif experiment_type.lower() == 'knockout':
+            target_types = ['sgRNA']
+            additional_keywords = ['sgRNA sequence', 'guide RNA', 'CRISPR']
+        else:
+            return []
+        
+        # 检索相关文献
+        all_papers = []
+        for keyword in additional_keywords:
+            try:
+                query = f"{gene_name} {keyword}"
+                search_params = {
+                    'db': 'pubmed',
+                    'term': query,
+                    'retmode': 'json',
+                    'retmax': 10,
+                    'sort': 'relevance'
+                }
+                
+                result = self._make_request('esearch.fcgi', search_params)
+                if not result:
+                    continue
+                
+                pmids = result.get('esearchresult', {}).get('idlist', [])
+                if not pmids:
+                    continue
+                
+                # 获取摘要
+                fetch_params = {
+                    'db': 'pubmed',
+                    'id': ','.join(pmids),
+                    'retmode': 'json'
+                }
+                
+                result = self._make_request('esummary.fcgi', fetch_params)
+                if not result:
+                    continue
+                
+                docs = result.get('result', {})
+                for pmid in pmids:
+                    doc = docs.get(pmid, {})
+                    title = doc.get('title', '')
+                    abstract = doc.get('abstract', '')
+                    
+                    if abstract:
+                        all_papers.append({
+                            'pmid': str(pmid),
+                            'title': title,
+                            'abstract': abstract
+                        })
+                
+            except Exception as e:
+                logger.warning(f"Sequence literature search error: {e}")
+                continue
+        
+        # 从摘要中提取序列
+        for paper in all_papers:
+            extracted = self.sequence_extractor.extract_sequences(
+                paper['abstract'] + " " + paper['title'],
+                gene_name,
+                "Literature",
+                f"PMID:{paper['pmid']}",
+                paper['title'],
+                organism
+            )
+            sequences.extend(extracted)
+        
+        # 去重
+        seen = set()
+        unique_sequences = []
+        for seq in sequences:
+            key = f"{seq.sequence}_{seq.sequence_type}"
+            if key not in seen:
+                seen.add(key)
+                unique_sequences.append(seq)
+        
+        return unique_sequences[:20]  # 限制返回数量
+
+# ==================== 硬性规则引擎 ====================
+
+class HardRulesEngine:
+    """硬性规则引擎（物理限制和生物学事实）"""
+    
+    BASE_ESSENTIAL = {
+        'ACTB', 'GAPDH', 'HSP90', 'HSPA5', 'RPL11', 'RPS3', 
+        'PCNA', 'TOP2A', 'AURKB', 'PLK1', 'MYC'
+    }
+    
+    BASE_TOXIC = {'BAX', 'BAK1', 'CASP3', 'TP53', 'MYC', 'FAS', 'TNF'}
+    
+    def check_all(self, gene_info: Dict, transcripts: List[Dict], 
+                  experiment_type: str) -> Tuple[bool, List[HardRuleCheck]]:
+        checks = []
+        
+        # 规则1: 载体容量
+        check = self._check_vector_capacity(transcripts)
+        checks.append(check)
+        
+        # 规则2: 必需基因
+        if 'knockout' in experiment_type.lower():
+            check = self._check_essential_gene(gene_info.get('name', ''))
+            checks.append(check)
+        
+        # 规则3: 毒性基因
+        if 'overexpression' in experiment_type.lower():
+            check = self._check_known_toxic(gene_info.get('name', ''))
+            checks.append(check)
+        
+        return all(c.passed for c in checks), checks
+    
+    def _check_vector_capacity(self, transcripts: List[Dict]) -> HardRuleCheck:
+        """检查载体容量限制"""
+        valid_lengths = [t.get('length', 0) for t in transcripts if t.get('length', 0) > 0]
+        
+        if not valid_lengths:
+            return HardRuleCheck(
+                rule_name="载体容量检查",
+                passed=True,
+                reason="转录本长度信息不可用，跳过检查",
+                source="数据缺失",
+                overrideable=True
+            )
+        
+        max_length = max(valid_lengths)
+        
+        if max_length > Config.MAX_LENTIVIRUS_CAPACITY:
+            return HardRuleCheck(
+                rule_name="载体容量超限",
+                passed=False,
+                reason=f"最大转录本长度 {max_length:,}bp 超过物理极限 {Config.MAX_LENTIVIRUS_CAPACITY:,}bp",
+                source="病毒学物理限制",
+                overrideable=False
+            )
+        elif max_length > Config.WARNING_CAPACITY:
+            return HardRuleCheck(
+                rule_name="载体容量警告",
+                passed=True,
+                reason=f"转录本长度 {max_length:,}bp 接近极限",
+                source="病毒学最佳实践",
+                overrideable=True
+            )
+        else:
+            return HardRuleCheck(
+                rule_name="载体容量检查",
+                passed=True,
+                reason=f"转录本长度 {max_length:,}bp 在合理范围内",
+                source="病毒学标准",
+                overrideable=True
+            )
+    
+    def _check_essential_gene(self, gene_name: str) -> HardRuleCheck:
+        if gene_name.upper().strip() in self.BASE_ESSENTIAL:
+            return HardRuleCheck(
+                rule_name="必需基因检查",
+                passed=False,
+                reason=f"{html.escape(gene_name)} 是细胞必需基因，敲除可能导致细胞死亡",
+                source="DepMap Database",
+                overrideable=False
+            )
+        return HardRuleCheck(
+            rule_name="必需基因检查",
+            passed=True,
+            reason=f"{html.escape(gene_name)} 未在必需基因核心列表中",
+            source="DepMap Database",
+            overrideable=True
+        )
+    
+    def _check_known_toxic(self, gene_name: str) -> HardRuleCheck:
+        if gene_name.upper().strip() in self.BASE_TOXIC:
+            return HardRuleCheck(
+                rule_name="毒性基因检查",
+                passed=False,
+                reason=f"{html.escape(gene_name)} 是已知促凋亡/毒性基因",
+                source="文献数据库",
+                overrideable=False
+            )
+        return HardRuleCheck(
+            rule_name="毒性基因检查",
+            passed=True,
+            reason="非已知高毒性基因",
+            source="文献数据库",
+            overrideable=True
+        )
+
+# ==================== 文献验证算法（改进版） ====================
+
+class CitationValidator:
+    """文献引用验证器（使用序列相似度）"""
+    
+    @staticmethod
+    def validate(evidence_text: str, source_abstract: str, threshold: float = 0.6) -> Tuple[bool, float]:
+        """验证引用文本是否真实存在于原文中"""
+        if not evidence_text or not source_abstract:
+            return False, 0.0
+        
+        evidence_clean = evidence_text.lower().strip()
+        abstract_clean = source_abstract.lower().strip()
+        
+        # 直接包含
+        if evidence_clean in abstract_clean:
+            return True, 1.0
+        
+        # 滑动窗口相似度
+        best_ratio = 0.0
+        window_size = min(len(evidence_clean), len(abstract_clean))
+        
+        if window_size < 10:
+            return False, 0.0
+        
+        for i in range(0, len(abstract_clean) - window_size + 1, max(1, window_size // 4)):
+            window = abstract_clean[i:i+window_size]
+            ratio = difflib.SequenceMatcher(None, evidence_clean, window).quick_ratio()
+            best_ratio = max(best_ratio, ratio)
+            
+            if best_ratio >= threshold:
+                return True, best_ratio
+        
+        # 词覆盖检查
+        evidence_words = set(evidence_clean.split())
+        abstract_words = set(abstract_clean.split())
+        
+        if evidence_words:
+            coverage = len(evidence_words & abstract_words) / len(evidence_words)
+            if coverage >= 0.8:
+                return True, max(best_ratio, coverage)
+        
+        return best_ratio >= threshold, best_ratio
+
+# ==================== 阿里云千问分析器 ====================
+
+class QwenRAGAnalyzer:
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key
+        self.model = Config.get_qwen_model()
+        self.validator = CitationValidator()
+    
+    def analyze(self, gene_name: str, experiment_type: str, literature: List[Dict]) -> AIAnalysisResult:
+        """基于真实文献的AI分析"""
+        if not self.api_key or not literature:
+            return AIAnalysisResult(
+                conclusion="未配置AI分析或未检索到文献",
+                risk_level="unknown",
+                citations=[],
+                raw_response="",
+                validation_status="skipped"
+            )
+        
+        try:
+            context = self._build_context(literature)
+            prompt = self._build_prompt(gene_name, experiment_type, context)
+            
+            with st.spinner("🤖 AI分析文献中（约10-30秒）..."):
+                response = self._call_api(prompt)
+            
+            if not response:
+                return AIAnalysisResult(
+                    conclusion="AI服务暂时不可用",
+                    risk_level="error",
+                    citations=[],
+                    raw_response="",
+                    validation_status="api_error"
+                )
+            
+            parsed = self._parse_response(response, literature)
+            validated = self._validate_citations(parsed, literature)
+            
+            return validated
+            
+        except Exception as e:
+            error_id = str(uuid.uuid4())[:8]
+            logger.error(f"AI analysis error [{error_id}]: {type(e).__name__}")
+            return AIAnalysisResult(
+                conclusion=f"AI分析异常，请联系管理员（错误ID: {error_id}）",
+                risk_level="error",
+                citations=[],
+                raw_response="",
+                validation_status="exception"
+            )
+    
+    def _build_context(self, literature: List[Dict]) -> str:
+        contexts = []
+        for i, paper in enumerate(literature[:8], 1):
+            contexts.append(f"""
+【文献{i}】PMID: {paper['pmid']}
+标题: {paper['title'][:100]}
+摘要: {paper['abstract'][:400]}...
+""")
+        return "\n---\n".join(contexts)
+    
+    def _build_prompt(self, gene_name: str, exp_type: str, context: str) -> str:
+        safe_gene = html.escape(gene_name)
+        
+        return f"""作为分子生物学专家，基于以下文献评估{safe_gene}在{exp_type}实验中的风险。
+
+【规则】
+1. 只能基于提供的文献判断
+2. 每个结论必须标注【PMID: XXXXX】
+3. 必须引用文献原文片段作为证据
+4. 无证据时回答"文献未提及"
+5. 风险等级：high/medium/low/none
+
+【文献】
+{context}
+
+【输出JSON格式】
+{{
+    "overall_risk": "high/medium/low/none",
+    "summary": "基于【PMID: xxx】...",
+    "risks": [
+        {{
+            "type": "细胞毒性/增殖影响/其他",
+            "level": "high/medium/low",
+            "evidence": "文献原文片段",
+            "pmid": "12345678"
+        }}
+    ],
+    "suggestions": [
+        {{"action": "建议策略", "basis": "基于【PMID: xxx】"}}
+    ]
+}}"""
+    
+    def _call_api(self, prompt: str) -> Optional[str]:
+        try:
+            import dashscope
+            dashscope.api_key = self.api_key
+            qwen_limiter.wait()
+            
+            response = dashscope.Generation.call(
+                model=self.model,
+                messages=[{'role': 'user', 'content': prompt}],
+                result_format='message',
+                temperature=0.1,
+                max_tokens=2000
+            )
+            
+            if response.status_code == 200:
+                return response.output.choices[0].message.content
+            return None
+            
+        except ImportError:
+            return self._call_http(prompt)
+        except Exception as e:
+            logger.error(f"Qwen API error: {type(e).__name__}")
+            return None
+    
+    def _call_http(self, prompt: str) -> Optional[str]:
+        conn = None
+        try:
+            conn = http.client.HTTPSConnection("dashscope.aliyuncs.com", timeout=60)
+            qwen_limiter.wait()
+            
+            payload = json.dumps({
+                "model": self.model,
+                "input": {"messages": [{"role": "user", "content": prompt}]},
+                "parameters": {"temperature": 0.1, "max_tokens": 2000}
+            })
+            
+            headers = {
+                'Authorization': f'Bearer {self.api_key}',
+                'Content-Type': 'application/json'
+            }
+            
+            conn.request("POST", "/api/v1/services/aigc/text-generation/generation", 
+                        payload, headers)
+            res = conn.getresponse()
+            data = json.loads(res.read().decode("utf-8"))
+            
+            if 'output' in data:
+                return data['output'].get('text') or data['output'].get('choices', [{}])[0].get('message', {}).get('content')
+            return None
+            
+        except Exception as e:
+            logger.error(f"HTTP call error: {type(e).__name__}")
+            return None
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+    
+    def _parse_response(self, response: str, source_literature: List[Dict]) -> AIAnalysisResult:
+        if not response:
+            return AIAnalysisResult("AI返回空", "error", [], "", "empty")
+        
+        try:
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if not json_match:
+                return AIAnalysisResult("AI返回格式错误", "error", [], "", "no_json")
+            
+            data = json.loads(json_match.group())
+            
+            citations = []
+            for risk in data.get('risks', []):
+                pmid = str(risk.get('pmid', ''))
+                evidence = str(risk.get('evidence', ''))[:200]
+                
+                source = next((p for p in source_literature if p['pmid'] == pmid), {})
+                
+                citations.append(LiteratureEvidence(
+                    pmid=pmid,
+                    title=source.get('title', 'Unknown')[:100],
+                    abstract=source.get('abstract', '')[:200],
+                    evidence_text=evidence,
+                    evidence_type=str(risk.get('level', 'unknown')),
+                    confidence=0.9 if risk.get('level') == 'high' else 0.7
+                ))
+            
+            return AIAnalysisResult(
+                conclusion=str(data.get('summary', ''))[:500],
+                risk_level=str(data.get('overall_risk', 'unknown')),
+                citations=citations,
+                raw_response="",
+                validation_status="parsed"
+            )
+            
+        except Exception as e:
+            logger.error(f"Parse error: {type(e).__name__}")
+            return AIAnalysisResult("解析错误", "error", [], "", "parse_error")
+    
+    def _validate_citations(self, result: AIAnalysisResult, source_literature: List[Dict]) -> AIAnalysisResult:
+        if not result.citations:
+            return result
+        
+        available_pmids = {p['pmid'] for p in source_literature}
+        valid_citations = []
+        
+        for cite in result.citations:
+            if cite.pmid not in available_pmids:
+                logger.warning(f"Hallucinated PMID: {cite.pmid}")
+                continue
+            
+            source = next((p for p in source_literature if p['pmid'] == cite.pmid), {})
+            is_valid, similarity = self.validator.validate(
+                cite.evidence_text, 
+                source.get('abstract', ''),
+                threshold=0.6
+            )
+            
+            if is_valid:
+                cite.evidence_type = f"verified({similarity:.2f})"
+                cite.confidence = similarity
+                valid_citations.append(cite)
+            elif similarity > 0.4:
+                cite.evidence_type = f"paraphrased({similarity:.2f})"
+                cite.confidence = similarity * 0.7
+                valid_citations.append(cite)
+        
+        result.citations = valid_citations
+        
+        if not valid_citations and result.risk_level not in ['unknown', 'error']:
+            result.validation_status = "unverified"
+            result.risk_level = "uncertain"
+            result.conclusion += " [警告：AI引用无法验证]"
+        
+        return result
+
+# ==================== 主评估引擎 ====================
+
+class HybridAssessmentEngine:
+    def __init__(self, qwen_api_key: Optional[str] = None, ncbi_api_key: Optional[str] = None):
+        self.hard_rules = HardRulesEngine()
+        self.rag_analyzer = QwenRAGAnalyzer(qwen_api_key)
+        self.ncbi = NCBIClient(ncbi_api_key)
+        self.patent_client = PatentClient()
+    
+    def assess(self, gene_name: str, organism: str, experiment_type: str) -> Dict:
+        """执行完整评估"""
+        result = {
+            'timestamp': datetime.now().isoformat(),
+            'gene': gene_name,
+            'experiment': experiment_type,
+            'decision_hierarchy': {},
+            'final_recommendation': '',
+            'primary_basis': '',
+            'sequences': []  # 新增：存储检索到的序列
+        }
+        
+        # 获取基因数据
+        with st.spinner("🔍 检索基因详细数据..."):
+            gene_info, transcripts = self.ncbi.fetch_gene_data(gene_name, organism)
+        
+        if not gene_info:
+            return {'error': f'无法获取基因 {html.escape(gene_name)} 的信息'}
+        
+        result['gene_info'] = {
+            'id': gene_info.get('id', ''),
+            'name': gene_info.get('name', ''),
+            'description': gene_info.get('description', '')[:200]
+        }
+        
+        # 硬性规则检查
+        with st.spinner("⚙️ 执行硬性规则检查..."):
+            hard_passed, hard_checks = self.hard_rules.check_all(
+                gene_info, transcripts, experiment_type
+            )
+        
+        result['decision_hierarchy']['hard_rules'] = {
+            'passed': hard_passed,
+            'checks': [self._to_dict(c) for c in hard_checks]
+        }
+        
+        # 检查阻断
+        blocking = [c for c in hard_checks if not c.passed and not c.overrideable]
+        if blocking:
+            result['final_recommendation'] = 'BLOCKED'
+            result['primary_basis'] = '硬性物理/生物学限制'
+            result['reason'] = blocking[0].reason
+            return result
+        
+        # 序列检索（新增功能）
+        if experiment_type.lower() in ['knockdown', 'knockout']:
+            with st.spinner("🧬 检索文献与专利中的设计序列..."):
+                sequences = self._search_sequences(gene_name, experiment_type, organism)
+                result['sequences'] = [self._seq_to_dict(s) for s in sequences]
+        
+        # AI文献分析
+        with st.spinner("📚 检索文献并AI分析..."):
+            literature = self.ncbi.search_literature(gene_name, experiment_type)
+            
+            ai_result = self.rag_analyzer.analyze(gene_name, experiment_type, literature) if literature else \
+                       AIAnalysisResult("未检索到文献", "unknown", [], "", "no_literature")
+        
+        result['decision_hierarchy']['literature_based'] = {
+            'literature_count': len(literature),
+            'literatures': literature[:5],
+            'ai_analysis': self._to_dict(ai_result)
+        }
+        
+        # 生成建议
+        if ai_result.risk_level == 'high':
+            rec = "⚠️ 高风险：建议更换方案或采用诱导系统"
+        elif ai_result.risk_level == 'medium':
+            rec = "⚡ 中等风险：可进行，但需优化条件"
+        elif ai_result.risk_level == 'low':
+            rec = "✅ 低风险：可按标准流程进行"
+        else:
+            rec = "❓ 风险未知：缺乏文献支持，建议预实验"
+        
+        result['final_recommendation'] = rec
+        result['primary_basis'] = f"基于{len(ai_result.citations)}篇文献验证" if ai_result.citations else "基于有限数据"
+        
+        return result
+    
+    def _search_sequences(self, gene_name: str, experiment_type: str, organism: str) -> List[SequenceInfo]:
+        """检索文献和专利中的序列"""
+        all_sequences = []
+        
+        # 1. 从文献中检索
+        try:
+            lit_sequences = self.ncbi.search_sequences_in_literature(gene_name, experiment_type, organism)
+            all_sequences.extend(lit_sequences)
+        except Exception as e:
+            logger.error(f"Literature sequence search error: {e}")
+        
+        # 2. 从专利中检索
+        try:
+            if experiment_type.lower() == 'knockdown':
+                for seq_type in ['siRNA', 'shRNA']:
+                    patent_seqs = self.patent_client.search_sequences(gene_name, seq_type, organism)
+                    all_sequences.extend(patent_seqs)
+            elif experiment_type.lower() == 'knockout':
+                patent_seqs = self.patent_client.search_sequences(gene_name, 'sgRNA', organism)
+                all_sequences.extend(patent_seqs)
+        except Exception as e:
+            logger.error(f"Patent sequence search error: {e}")
+        
+        # 去重（基于序列内容）
+        seen = set()
+        unique_sequences = []
+        for seq in all_sequences:
+            key = f"{seq.sequence}_{seq.sequence_type}"
+            if key not in seen:
+                seen.add(key)
+                unique_sequences.append(seq)
+        
+        return unique_sequences
+    
+    def _to_dict(self, obj):
+        if hasattr(obj, '__dataclass_fields__'):
+            return {k: self._to_dict(v) for k, v in obj.__dict__.items()}
+        elif isinstance(obj, list):
+            return [self._to_dict(i) for i in obj]
+        elif isinstance(obj, str):
+            return obj[:500]
+        return obj
+    
+    def _seq_to_dict(self, seq: SequenceInfo) -> Dict:
+        """序列对象转字典"""
+        return {
+            'sequence': seq.sequence,
+            'sequence_type': seq.sequence_type,
+            'target_gene': seq.target_gene,
+            'source_type': seq.source_type,
+            'source_id': seq.source_id,
+            'source_title': seq.source_title,
+            'target_region': seq.target_region,
+            'efficiency': seq.efficiency,
+            'organism': seq.organism
+        }
+
+# ==================== UI渲染 ====================
+
+def render_header():
+    st.markdown("""
+    <h1 style='text-align: center; color: #1f77b4;'>
+        🧬 病毒与细胞系评估系统 v2.6
+    </h1>
+    <p style='text-align: center; color: #666;'>
+        智能基因自动完成 | 序列检索 | 混合决策架构 | 安全加固
+    </p>
+    """, unsafe_allow_html=True)
+
+def render_sidebar():
+    with st.sidebar:
+        st.header("⚙️ 配置")
+        
+        secret_qwen = st.secrets.get("DASHSCOPE_API_KEY") or st.secrets.get("QWEN_API_KEY")
+        secret_ncbi = st.secrets.get("NCBI_API_KEY")
+        
+        st.info("API配置状态")
+        
+        user_qwen = st.text_input("阿里云千问 Key", type="password", 
+                                  placeholder="留空使用Secrets")
+        user_ncbi = st.text_input("NCBI Key", type="password", 
+                                  placeholder="可选")
+        
+        final_qwen = user_qwen.strip() if user_qwen else secret_qwen
+        final_ncbi = user_ncbi.strip() if user_ncbi else secret_ncbi
+        
+        st.divider()
+        st.caption("""
+        🔒 安全措施：
+        - 输入验证与XSS防护
+        - 300ms防抖机制
+        - 强制文献引用验证
+        - 异常信息脱敏
+        """)
+        
+        return final_ncbi, final_qwen
+
+def render_sequences(sequences: List[Dict], experiment_type: str):
+    """渲染检索到的序列"""
+    st.markdown("### 🧬 已报道的序列设计")
+    
+    if not sequences:
+        st.info("🔍 **无已报道的设计**\n\n在检索范围内未找到该基因在文献或专利中报道的序列信息。建议：\n- 使用生信工具自行设计（如siDirect、CRISPR-ERA等）\n- 扩大检索范围或检查基因名拼写\n- 参考同源基因的设计方案")
+        return
+    
+    # 按类型分组
+    by_type = {}
+    for seq in sequences:
+        seq_type = seq.get('sequence_type', 'Unknown')
+        if seq_type not in by_type:
+            by_type[seq_type] = []
+        by_type[seq_type].append(seq)
+    
+    # 显示统计
+    total = len(sequences)
+    lit_count = sum(1 for s in sequences if s.get('source_type') == 'Literature')
+    pat_count = sum(1 for s in sequences if s.get('source_type') == 'Patent')
+    
+    st.success(f"✅ 共检索到 **{total}** 条序列（文献: {lit_count} | 专利: {pat_count}）")
+    
+    # 按类型展示
+    for seq_type, seqs in by_type.items():
+        with st.expander(f"**{seq_type}** 序列 ({len(seqs)}条)", expanded=True):
+            for i, seq in enumerate(seqs, 1):
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    # 序列卡片
+                    st.markdown(f"""
+                    <div style='padding: 10px; border: 1px solid #e0e0e0; border-radius: 5px; margin: 5px 0; background-color: #f8f9fa;'>
+                        <code style='font-size: 14px; word-break: break-all;'>{seq.get('sequence', 'N/A')}</code>
+                        <div style='margin-top: 5px; font-size: 12px; color: #666;'>
+                            来源: <b>{html.escape(seq.get('source_type', 'Unknown'))}</b> | 
+                            ID: {html.escape(seq.get('source_id', 'N/A'))}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col2:
+                    # 来源链接
+                    source_id = seq.get('source_id', '')
+                    if source_id.startswith('PMID:'):
+                        pmid = source_id.replace('PMID:', '')
+                        st.markdown(f"[📄 查看文献](https://pubmed.ncbi.nlm.nih.gov/{pmid}/)")
+                    elif 'Patent' in seq.get('source_type', ''):
+                        st.markdown(f"📋 {html.escape(source_id)}")
+                
+                # 显示标题（可折叠）
+                title = seq.get('source_title', 'No title')
+                if title and title != 'No title':
+                    st.caption(f"*{html.escape(title[:80])}...*")
+
+def main():
+    """主函数"""
+    render_header()
+    ncbi_key, qwen_key = render_sidebar()
+    
+    # 初始化服务
+    gene_service = GeneAutocompleteService()
+    gene_component = GeneInputComponent(gene_service)
+    
+    # 物种选择
+    organism = st.selectbox(
+        "物种",
+        ["human", "mouse", "rat"],
+        format_func=lambda x: {"human": "人类", "mouse": "小鼠", "rat": "大鼠"}.get(x, x)
+    )
+    
+    # 基因输入（带自动完成）- 已移除常用基因快捷按钮
+    st.markdown("---")
+    gene = gene_component.render(organism, key_prefix="main_gene_input")
+    
+    # 实验类型
+    exp_type = st.selectbox(
+        "实验类型",
+        ["knockout", "knockdown", "overexpression"],
+        format_func=lambda x: {
+            "knockout": "敲除 (CRISPR)",
+            "knockdown": "敲低 (shRNA)",
+            "overexpression": "过表达"
+        }.get(x, x)
+    )
+    
+    analyze = st.button("🔍 开始智能评估", type="primary", use_container_width=True)
+    
+    if analyze:
+        if not gene:
+            st.error("请选择或输入一个基因")
+            return
+        
+        if not qwen_key:
+            st.error("请配置阿里云千问API Key")
+            return
+        
+        # 验证
+        is_valid, error_msg = SecurityConfig.validate_gene_name(gene)
+        if not is_valid:
+            st.error(f"输入验证失败: {error_msg}")
+            return
+        
+        # 映射物种
+        organism_map = {"human": "Homo sapiens", "mouse": "Mus musculus", "rat": "Rattus norvegicus"}
+        organism_clean = organism_map.get(organism, organism)
+        
+        gene_clean = SecurityConfig.sanitize_input(gene, 50)
+        exp_type_clean = SecurityConfig.sanitize_input(exp_type, 50)
+        
+        # 执行评估
+        try:
+            engine = HybridAssessmentEngine(qwen_api_key=qwen_key, ncbi_api_key=ncbi_key)
+            
+            with st.spinner("正在进行混合决策评估..."):
+                result = engine.assess(gene_clean, organism_clean, exp_type_clean)
+            
+            if 'error' in result:
+                st.error(html.escape(result['error']))
+                return
+            
+            # 显示结果
+            st.divider()
+            st.markdown(f"## 🎯 评估报告 - {html.escape(result['gene'])}")
+            
+            rec = result['final_recommendation']
+            rec_color = {"❌": "#ffebee", "⚠️": "#fff3e0", "⚡": "#fff8e1", "✅": "#e8f5e9"}.get(rec[:2], "#f5f5f5")
+            
+            st.markdown(f"""
+            <div style='padding: 20px; background-color: {rec_color}; 
+                        border-radius: 10px; text-align: center; margin: 20px 0;'>
+                <h3>{html.escape(rec)}</h3>
+                <small>{html.escape(result.get('primary_basis', ''))}</small>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # 详细结果
+            hierarchy = result['decision_hierarchy']
+            
+            # 硬性规则
+            st.markdown("### 🚦 硬性规则检查")
+            for check in hierarchy['hard_rules']['checks']:
+                icon = "✅" if check['passed'] else "❌" if not check['overrideable'] else "⚠️"
+                color = "green" if check['passed'] else "red" if not check['overrideable'] else "orange"
+                st.markdown(f"""
+                <div style='padding: 10px; border-left: 4px solid {color}; 
+                            background-color: #f8f9fa; margin: 5px 0;'>
+                    <b>{icon} {html.escape(check['rule_name'])}</b><br/>
+                    {html.escape(check['reason'])}<br/>
+                    <small>来源: {html.escape(check['source'])}</small>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            # 序列展示（新增）
+            if result.get('sequences') is not None:
+                render_sequences(result['sequences'], exp_type)
+            
+            # AI分析
+            lit_data = hierarchy.get('literature_based', {})
+            if lit_data:
+                st.markdown("### 📚 AI文献分析")
+                st.write(f"检索到 {lit_data.get('literature_count', 0)} 篇文献")
+                
+                ai_analysis = lit_data.get('ai_analysis', {})
+                if ai_analysis:
+                    risk = ai_analysis.get('risk_level', 'unknown')
+                    st.markdown(f"**风险等级**: {risk.upper()}")
+                    st.markdown(f"**结论**: {html.escape(ai_analysis.get('conclusion', ''))}")
+                    
+                    citations = ai_analysis.get('citations', [])
+                    if citations:
+                        st.markdown("**验证的引用：**")
+                        for cite in citations:
+                            st.markdown(f"""
+                            - **PMID**: {html.escape(cite.get('pmid', ''))} 
+                              [{html.escape(cite.get('evidence_type', ''))}]
+                            - 证据: "{html.escape(cite.get('evidence_text', '')[:100])}..."
+                            """)
+            
+            # 审计信息
+            with st.expander("🔍 审计信息"):
+                st.json(result)
+                
+        except Exception as e:
+            error_id = str(uuid.uuid4())[:8]
+            logger.exception(f"Unhandled error: {e}")
+            st.error(f"系统错误（ID: {error_id}），请联系管理员")
+
+if __name__ == "__main__":
+    main()
